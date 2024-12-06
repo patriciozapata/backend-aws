@@ -1,0 +1,3 @@
+paramiko
+boto3
+pandas

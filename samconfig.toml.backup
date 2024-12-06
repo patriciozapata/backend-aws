@@ -1,0 +1,10 @@
+version = 0.1
+[default.deploy.parameters]
+stack_name = "backend5"
+resolve_s3 = true
+s3_prefix = "backend5"
+region = "us-west-1"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+parameter_overrides = "KeyName=\"my-ec2-keypair\" AllowedSSHIP=\"0.0.0.0/0\" ScriptName=\"test.py\" BucketName=\"zock\" ScriptFolder=\"script-stage\" PythonVersion=\"3.9.13\""
+image_repositories = []
