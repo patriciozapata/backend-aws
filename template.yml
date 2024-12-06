@@ -1,0 +1,356 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Infraestructura AWS para conectar Lambda con EC2 usando SSH y S3
+  para almacenamiento del código, y Amplify + Cognito para autenticación.
+
+Parameters:
+  KeyName:
+    Description: Nombre del par de claves para acceder a la instancia EC2.
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: my-ec2-keypair
+
+  AllowedSSHIP:
+    Description: Dirección IP permitida para acceso SSH (formato CIDR).
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+$
+    ConstraintDescription: Debe ser una dirección IP válida en formato CIDR.
+
+  BucketName:
+    Description: Nombre del bucket S3 donde está la clave SSH.
+    Type: String
+    Default: zock
+
+  ScriptFolder:
+    Description: Carpeta donde se encuentran los scripts en el bucket S3.
+    Type: String
+    Default: script-stage
+
+  ScriptName:
+    Description: Nombre del script Python a ejecutar desde S3.
+    Type: String
+    Default: test.py
+
+  SSHKeySecretName:
+    Description: Nombre del secreto en Secrets Manager donde se almacena la clave SSH.
+    Type: String
+    Default: zockproyect
+
+  PythonVersion:
+    Description: Versión de Python que se instalará en la instancia EC2.
+    Type: String
+    Default: 3.9.13
+
+Resources:
+  # Cognito User Pool
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: MyAppUserPool
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: MyAppUserPoolClient
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: false
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows:
+        - implicit
+      AllowedOAuthScopes:
+        - email
+        - openid
+        - profile
+      CallbackURLs:
+        - https://localhost:3000/
+
+  CognitoIdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      IdentityPoolName: MyAppIdentityPool
+      AllowUnauthenticatedIdentities: false
+      CognitoIdentityProviders:
+        - ClientId: !Ref CognitoUserPoolClient
+          ProviderName: !GetAtt CognitoUserPool.ProviderName
+
+  CognitoIdentityPoolRoleAttachment:
+    Type: AWS::Cognito::IdentityPoolRoleAttachment
+    Properties:
+      IdentityPoolId: !Ref CognitoIdentityPool
+      Roles:
+        authenticated: !GetAtt CognitoAuthRole.Arn
+
+  CognitoAuthRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: cognito-identity.amazonaws.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                cognito-identity.amazonaws.com:aud: !Ref CognitoIdentityPool
+              ForAnyValue:StringLike:
+                cognito-identity.amazonaws.com:amr: authenticated
+      Policies:
+        - PolicyName: AllowInvokeApi
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: execute-api:Invoke
+                Resource: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${MyApiGateway}/Prod/POST/invoke
+
+  # VPC y Subredes
+  MyVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: MyVPC
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs ''
+      Tags:
+        - Key: Name
+          Value: PublicSubnet
+
+  # Internet Gateway
+  MyInternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  MyVPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref MyVPC
+      InternetGatewayId: !Ref MyInternetGateway
+
+  # Tabla de rutas
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MyVPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref MyInternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref MyVPC
+      GroupDescription: Allow SSH Traffic
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedSSHIP
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EC2S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${BucketName}
+                  - !Sub arn:aws:s3:::${BucketName}/${ScriptFolder}/*
+                  - !Sub arn:aws:s3:::${BucketName}/*
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2InstanceRole
+
+  # Instancia EC2
+  MyInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t2.micro
+      ImageId: ami-0c02fb55956c7d316 # Cambiar a la AMI adecuada
+      KeyName: !Ref KeyName
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      UserData: !Base64
+        Fn::Sub: |
+          #!/bin/bash
+          set -e
+          echo "Actualizando paquetes y configurando la instancia..."
+          sudo yum update -y
+          sudo yum install -y python3 python3-pip
+          echo "Instalando bibliotecas necesarias para Python..."
+          python3 -m pip install --upgrade pip
+          python3 -m pip install pandas openpyxl boto3 selenium
+          echo "Instalando Chrome y Chromedriver para Selenium..."
+          sudo yum install -y wget unzip
+          wget https://dl.google.com/linux/direct/google-chrome-stable_current_x86_64.rpm
+          sudo yum localinstall -y google-chrome-stable_current_x86_64.rpm
+          CHROMEDRIVER_VERSION=$(curl -s https://chromedriver.storage.googleapis.com/LATEST_RELEASE)
+          wget https://chromedriver.storage.googleapis.com/$CHROMEDRIVER_VERSION/chromedriver_linux64.zip
+          unzip chromedriver_linux64.zip
+          sudo mv chromedriver /usr/local/bin/
+          sudo chmod +x /usr/local/bin/chromedriver
+          echo "Configuración de Selenium completada."
+          echo "Descargando script desde S3..."
+          aws s3 cp s3://${BucketName}/${ScriptFolder}/${ScriptName} /home/ec2-user/${ScriptName} || { echo "Error al descargar el script."; exit 1; }
+          sudo chmod +x /home/ec2-user/${ScriptName}
+          echo "Instancia configurada correctamente."
+
+  # Política del Bucket S3
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref BucketName
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:role/${EC2InstanceRole}
+            Action:
+              - s3:GetObject
+              - s3:ListBucket
+            Resource:
+              - !Sub arn:aws:s3:::${BucketName}
+              - !Sub arn:aws:s3:::${BucketName}/${ScriptFolder}/*
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - secretsmanager:GetSecretValue
+                  - s3:GetObject
+                Resource: '*'
+
+  MyApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: MyLambdaApiGateway
+      StageName: Prod
+      Cors:
+        AllowMethods: '''GET, POST, OPTIONS''' # Asegúrate de permitir los métodos necesarios
+        AllowHeaders: '''Content-Type,Authorization'''
+        AllowOrigin: '''*'''
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt CognitoUserPool.Arn
+            IdentitySource: method.request.header.Authorization
+
+  MyLambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: AccessEC2ViaSSH
+      Runtime: python3.9
+      Handler: handler.lambda_handler
+      CodeUri: ./lambda
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 120
+      MemorySize: 256
+      Environment:
+        Variables:
+          REGION: !Ref AWS::Region
+          EC2_INSTANCE_ID: !Ref MyInstance
+          SECRET_NAME: zockproyect
+          BUCKET_NAME: !Ref BucketName
+          SCRIPT_FOLDER: !Ref ScriptFolder
+          SCRIPT_NAME: !Ref ScriptName
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            Path: /invoke
+            Method: POST
+            RestApiId: !Ref MyApiGateway
+
+Outputs:
+  EC2InstanceId:
+    Description: ID de la instancia EC2
+    Value: !Ref MyInstance
+
+  LambdaFunctionName:
+    Description: Nombre de la función Lambda
+    Value: !Ref MyLambdaFunction
+
+  ApiGatewayUrl:
+    Description: URL del API Gateway
+    Value: !Sub https://${MyApiGateway}.execute-api.${AWS::Region}.amazonaws.com/Prod
+
+  CognitoUserPoolId:
+    Description: ID del Cognito User Pool
+    Value: !Ref CognitoUserPool
+
+  CognitoIdentityPoolId:
+    Description: ID del Cognito Identity Pool
+    Value: !Ref CognitoIdentityPool
+
+  CognitoUserPoolClientId:
+    Description: ID del Cognito User Pool Client
+    Value: !Ref CognitoUserPoolClient
